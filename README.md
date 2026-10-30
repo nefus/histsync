@@ -61,9 +61,10 @@ kept).
 
 Without any filter, `histsync search` means `--here` (current host and
 directory, shown without the host and directory columns); `histsync` without a
-subcommand is the same as `histsync search` (e.g. `histsync -a docker`). A handy alias:
+subcommand is the same as `histsync search` (e.g. `histsync -a docker`). That
+makes a short alias handy:
 
-    alias hs='histsync search'
+    alias hs=histsync    # hs, hs -a docker, hs -. git, hs status, ...
 
 Tab completion for `histsync` is part of `histsync.bash` and does not need
 the bash-completion package. It completes subcommands and options, hosts
