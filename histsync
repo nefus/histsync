@@ -23,6 +23,7 @@ tombstone is undone by a peer on the next sync.
 
 "histsync search" without any filter shows the history of the current host
 in the current directory; -a/--all shows all hosts and directories.
+"histsync" without arguments is the same as "histsync search".
 
 Configuration: ~/.config/histsync/config (KEY=VALUE); environment variables
 of the same name take precedence:
@@ -574,7 +575,7 @@ def main():
     p.add_argument("prefix", nargs="?", default="")
     p.set_defaults(func=cmd_complete)
 
-    a = ap.parse_args()
+    a = ap.parse_args(sys.argv[1:] or ["search"])
     os.umask(0o077)
     sys.exit(a.func(a) or 0)
 
