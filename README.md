@@ -35,6 +35,7 @@ Requirements: bash >= 4.4, python3 >= 3.7 (standard library only), ssh.
     ./install.sh                         # install locally
     ./install.sh user@server             # install on another host via SSH
     ./install.sh -p laptop user@server   # ... and register laptop as its peer
+    ./install.sh --import-bash-history   # ... and import the existing ~/.bash_history
     histsync add laptop                  # register a peer and sync right away
     histsync remove laptop               # unregister a peer (its entries stay)
     histsync peers
@@ -82,6 +83,20 @@ sourced (as with `~/.bash_aliases`); otherwise add
 | `HISTSYNC_SSH_OPTS`   | additional ssh options, e.g. `-p 2222`                  |
 | `HISTSYNC_SHELL_SYNC` | `1` = the hook triggers `sync` itself (without systemd) |
 | `HISTSYNC_HOSTNAME`   | own name towards peers (default: short hostname)        |
+
+## Importing ~/.bash_history
+
+    histsync import-bash-history [FILE] [--until TIME] [--dry-run]
+
+Imports `$HISTFILE` or `~/.bash_history` (`install.sh --import-bash-history`
+does this right after installing). Only commands with a timestamp are taken,
+i.e. those written while `HISTTIMEFORMAT` was set; as in Bash, all lines
+between two `#<epoch>` lines form one command. The file has no directory or
+exit status, so these entries are not found by `--here`/`-d`. By default only
+commands before the first one recorded by the hook on this host are imported,
+so nothing ends up twice; the IDs are derived from host, time and command,
+which makes repeating the import harmless. Undo with
+`histsync delete -o import:bash_history -H HOST`.
 
 ## Spool format and imports
 

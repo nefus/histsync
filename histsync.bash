@@ -91,7 +91,7 @@ _histsync_complete ()
     [[ -x $bin ]] || bin=histsync
     COMPREPLY=()
     if (( cword == 1 )) && [[ $cur != -* ]]; then
-        COMPREPLY=($(compgen -W "sync add remove peers status search delete" -- "$cur"))
+        COMPREPLY=($(compgen -W "sync add remove peers status search delete import-bash-history" -- "$cur"))
         return
     fi
     # Without a subcommand, histsync runs search
@@ -118,6 +118,12 @@ _histsync_complete ()
         search) opts="-H --host -d --dir -s --since -x --exact -o --origin -. --here -a --all -n --limit" ;;
         delete) opts="-H --host -d --dir -s --since -x --exact -o --origin --id -y --yes" ;;
         sync)   opts="-q --quiet --peer" ;;
+        import-bash-history)
+                opts="--until --dry-run"
+                if [[ $cur != -* && $prev != --until ]]; then
+                    compopt -o default 2>/dev/null
+                    return
+                fi ;;
         add)    opts="--no-sync"
                 if [[ $cur != -* ]]; then
                     if declare -F _known_hosts_real >/dev/null; then

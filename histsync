@@ -25,6 +25,10 @@ tombstone is undone by a peer on the next sync.
 in the current directory; -a/--all shows all hosts and directories.
 "histsync" without a subcommand is the same as "histsync search".
 
+"histsync import-bash-history" imports ~/.bash_history (only commands with a
+timestamp, i.e. written with HISTTIMEFORMAT set; without directory and exit
+status), by default only commands from before the hook started on this host.
+
 Configuration: ~/.config/histsync/config (KEY=VALUE); environment variables
 of the same name take precedence:
   HISTSYNC_DB          local database (default ~/.local/share/histsync/history.sqlite)
@@ -36,7 +40,9 @@ of the same name take precedence:
 import argparse
 import datetime
 import fcntl
+import getpass
 import glob
+import hashlib
 import json
 import os
 import re
@@ -471,7 +477,7 @@ def print_rows(rows, short=False):
         if short:
             print("%s %3s  %s" % (t, ex, cmd.replace("\n", "\n    ")))
         else:
-            print("%s  %-10s %-30s %3s  %s" % (t, host, pwd, ex, cmd.replace("\n", "\n    ")))
+            print("%s  %-10s %-30s %3s  %s" % (t, host, pwd or "", ex, cmd.replace("\n", "\n    ")))
 
 
 def cmd_search(a):
@@ -535,6 +541,66 @@ def cmd_delete(a):
     print("%d entries deleted; peers will follow on the next sync" % len(rows))
 
 
+def parse_bash_history(path):
+    """(timestamp, command) pairs from a Bash history file. As in Bash, all
+    lines between two "#<epoch>" lines form one (possibly multi-line)
+    command; lines before the first timestamp have no time (None)."""
+    ts, lines = None, []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if re.fullmatch(r"#\d{9,}", line):
+                if lines:
+                    yield ts, "\n".join(lines)
+                ts, lines = int(line[1:]), []
+            elif ts is None:
+                yield None, line
+            else:
+                lines.append(line)
+    if lines:
+        yield ts, "\n".join(lines)
+
+
+def cmd_import_bash_history(a):
+    path = os.path.expanduser(a.file or os.environ.get("HISTFILE") or "~/.bash_history")
+    if not os.path.isfile(path):
+        print("%s does not exist, nothing to import" % path)
+        return 0
+    db = open_ingested(config())
+    host = socket.gethostname()  # what the hook stores as $HOSTNAME
+    if a.until:
+        until = int(datetime.datetime.fromisoformat(a.until).timestamp())
+    else:
+        # Up to the first command the hook recorded on this host (or now),
+        # so nothing is imported twice.
+        until = db.execute("SELECT min(ts) FROM history WHERE host IN (?, ?) AND origin = 'hook'",
+                           (host, hostname())).fetchone()[0] or int(time.time())
+    user = getpass.getuser()
+    records, untimed, later = [], 0, 0
+    for ts, cmd in parse_bash_history(path):
+        if ts is None:
+            untimed += 1
+        elif ts >= until:
+            later += 1
+        elif cmd.strip():
+            digest = hashlib.sha1(cmd.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+            records.append({"id": "import:bash_history:%s:%d:%s" % (host, ts, digest), "host": host,
+                            "user": user, "ts": ts, "tz": time.strftime("%z", time.localtime(ts)), "cmd": cmd,
+                            "origin": "import:bash_history"})
+    when = datetime.datetime.fromtimestamp(until).strftime("%Y-%m-%d %H:%M:%S")
+    if a.dry_run:
+        print("%s: would import %d commands from before %s" % (path, len(records), when))
+    else:
+        with db:
+            got, new, bad = insert(db, records, None)
+        print("%s: %d commands from before %s, %d new" % (path, got, when, new))
+    if later:
+        print("%d later commands skipped" % later)
+    if untimed:
+        print("%d commands without timestamp skipped (HISTTIMEFORMAT was not set)" % untimed)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="histsync", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -584,6 +650,13 @@ def main():
     p.add_argument("--after", type=int, default=0)
     p.add_argument("--del-after", type=int, default=0)
     p.set_defaults(func=cmd_exchange)
+
+    p = sub.add_parser("import-bash-history", help="import ~/.bash_history (commands with timestamps)")
+    p.add_argument("file", nargs="?", help="history file (default $HISTFILE or ~/.bash_history)")
+    p.add_argument("--until", help="only commands before this time, e.g. '2026-10-30 12:00' "
+                                    "(default: first command recorded by the hook on this host)")
+    p.add_argument("--dry-run", action="store_true", help="only count, import nothing")
+    p.set_defaults(func=cmd_import_bash_history)
 
     p = sub.add_parser("_complete", help="(internal) candidates for the Bash completion")
     p.add_argument("what", choices=("hosts", "origins", "peers", "dirs"))

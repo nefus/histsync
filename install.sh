@@ -1,14 +1,17 @@
 #!/bin/bash
 # Install or remove histsync.
 #
-#   ./install.sh [-p PEER]... [--no-systemd] [--uninstall] [SSH-DESTINATION]
+#   ./install.sh [-p PEER]... [--import-bash-history] [--no-systemd] [--uninstall]
+#                [SSH-DESTINATION]
 #
 # Without SSH-DESTINATION, histsync is installed locally for the current user;
 # with SSH-DESTINATION (e.g. "user@server"), the package is copied there and
 # installed on that host. -p registers peers the host syncs with (like
 # "histsync add PEER"); this requires non-interactive SSH access from the
 # host to the peer. Alternatively, another host registers the new one as its
-# peer. Requirements: bash >= 4.4, python3 >= 3.7.
+# peer. --import-bash-history imports the existing ~/.bash_history (commands
+# with timestamps only, see "histsync import-bash-history --help").
+# Requirements: bash >= 4.4, python3 >= 3.7.
 #
 # Installed files:
 #   ~/.local/bin/histsync                    sync, search, peer management
@@ -21,11 +24,12 @@
 set -euo pipefail
 
 src=$(cd "$(dirname "$0")" && pwd)
-peers=() systemd=auto uninstall= target=
+peers=() systemd=auto uninstall= import= target=
 while (( $# )); do
     case $1 in
         -p|--peer) peers+=("$2"); shift ;;
         --no-systemd) systemd=no ;;
+        --import-bash-history) import=1 ;;
         --uninstall) uninstall=1 ;;
         -h|--help) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 0 ;;
         -*) echo "unknown option: $1" >&2; exit 2 ;;
@@ -39,6 +43,7 @@ if [[ -n $target ]]; then
     for p in "${peers[@]}"; do args+=(-p "$p"); done
     [[ $systemd == no ]] && args+=(--no-systemd)
     [[ -n $uninstall ]] && args+=(--uninstall)
+    [[ -n $import ]] && args+=(--import-bash-history)
     script='set -e; d=$(mktemp -d); trap "rm -rf \"$d\"" EXIT; tar -C "$d" -xf -; bash "$d/install.sh" "$@"'
     tar -C "$src" -cf - histsync histsync.bash histsync.service histsync.timer install.sh |
         ssh "$target" "bash -c $(printf %q "$script") install.sh ${args[*]@Q}"
@@ -116,6 +121,7 @@ if ! grep -qF "$hook_line" "$bashrc" 2>/dev/null; then
 fi
 
 echo "histsync installed on $(hostname); sync via $mode."
+[[ -n $import ]] && "$bin/histsync" import-bash-history
 for p in "${peers[@]}"; do
     "$bin/histsync" add "$p" ||
         echo "Note: $p is not reachable right now, the next sync will retry." >&2
