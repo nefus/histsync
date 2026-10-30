@@ -73,21 +73,26 @@ _histsync_hook ()
     return $rc
 }
 
-# Completion for histsync and hs; values for -H, -d, -o and peers come from
-# the local database. Works without the bash-completion package.
+# Completion for histsync and aliases of it (e.g. alias hs='histsync search');
+# values for -H, -d, -o and peers come from the local database. Works without
+# the bash-completion package.
 _histsync_complete ()
 {
-    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
-    local bin=$HOME/.local/bin/histsync sub opts
+    local -a words=("${COMP_WORDS[@]}") expansion
+    local cword=$COMP_CWORD
+    # Alias: complete as if it were expanded
+    if [[ -n ${BASH_ALIASES[${words[0]}]-} ]]; then
+        read -ra expansion <<< "${BASH_ALIASES[${words[0]}]}"
+        words=("${expansion[@]}" "${words[@]:1}")
+        (( cword += ${#expansion[@]} - 1 ))
+    fi
+    local cur=${words[cword]} prev=${words[cword-1]}
+    local bin=$HOME/.local/bin/histsync sub=${words[1]} opts
     [[ -x $bin ]] || bin=histsync
     COMPREPLY=()
-    if [[ ${COMP_WORDS[0]##*/} == hs ]]; then
-        sub=search
-    elif (( COMP_CWORD == 1 )); then
+    if (( cword == 1 )); then
         COMPREPLY=($(compgen -W "sync add remove peers status search delete" -- "$cur"))
         return
-    else
-        sub=${COMP_WORDS[1]}
     fi
     case $prev in
         -H|--host|-o|--origin|--peer)
@@ -108,7 +113,7 @@ _histsync_complete ()
             return ;;
     esac
     case $sub in
-        search) opts="-H --host -d --dir -s --since -x --exact -o --origin -. --here -n --limit" ;;
+        search) opts="-H --host -d --dir -s --since -x --exact -o --origin -. --here -a --all -n --limit" ;;
         delete) opts="-H --host -d --dir -s --since -x --exact -o --origin --id -y --yes" ;;
         sync)   opts="-q --quiet --peer" ;;
         add)    opts="--no-sync"
@@ -128,7 +133,14 @@ _histsync_complete ()
     esac
     [[ $cur == -* ]] && COMPREPLY=($(compgen -W "$opts -h --help" -- "$cur"))
 }
-complete -F _histsync_complete histsync hs
+complete -F _histsync_complete histsync
+# Aliases defined before this file is sourced get the completion too; for
+# later ones: complete -F _histsync_complete ALIAS
+_histsync_alias=
+for _histsync_alias in "${!BASH_ALIASES[@]}"; do
+    [[ ${BASH_ALIASES[$_histsync_alias]%% *} == *histsync ]] && complete -F _histsync_complete "$_histsync_alias"
+done
+unset _histsync_alias
 
 # Prepend, so that $? is still the status of the command. A starship loaded
 # later moves the hook into STARSHIP_PROMPT_COMMAND and provides the status
