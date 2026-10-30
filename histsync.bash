@@ -90,10 +90,12 @@ _histsync_complete ()
     local bin=$HOME/.local/bin/histsync sub=${words[1]} opts
     [[ -x $bin ]] || bin=histsync
     COMPREPLY=()
-    if (( cword == 1 )); then
+    if (( cword == 1 )) && [[ $cur != -* ]]; then
         COMPREPLY=($(compgen -W "sync add remove peers status search delete" -- "$cur"))
         return
     fi
+    # Without a subcommand, histsync runs search
+    [[ $sub == -* ]] && sub=search
     case $prev in
         -H|--host|-o|--origin|--peer)
             local what=hosts

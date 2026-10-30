@@ -59,8 +59,8 @@ kept).
         "select * from history_v where exit <> 0 order by time desc limit 20"
 
 Without any filter, `histsync search` means `--here` (current host and
-directory, shown without the host and directory columns); `histsync` without
-arguments is the same as `histsync search`. A handy alias:
+directory, shown without the host and directory columns); `histsync` without a
+subcommand is the same as `histsync search` (e.g. `histsync -a docker`). A handy alias:
 
     alias hs='histsync search'
 

@@ -23,7 +23,7 @@ tombstone is undone by a peer on the next sync.
 
 "histsync search" without any filter shows the history of the current host
 in the current directory; -a/--all shows all hosts and directories.
-"histsync" without arguments is the same as "histsync search".
+"histsync" without a subcommand is the same as "histsync search".
 
 Configuration: ~/.config/histsync/config (KEY=VALUE); environment variables
 of the same name take precedence:
@@ -39,6 +39,7 @@ import fcntl
 import glob
 import json
 import os
+import re
 import shlex
 import socket
 import sqlite3
@@ -98,6 +99,15 @@ CREATE TABLE IF NOT EXISTS peers (
     msg      TEXT
 );
 """
+
+
+# pwd without repeated or trailing slashes ("/home/u//doc/" -> "/home/u/doc"),
+# in Python and in SQL; e.g. a HOME of "/home/u/" makes ~/doc "/home/u//doc".
+NORM_PWD = "rtrim(replace(replace(pwd, '//', '/'), '//', '/'), '/')"
+
+
+def norm_path(path):
+    return re.sub("/+", "/", path).rstrip("/")
 
 
 def config():
@@ -179,6 +189,8 @@ def insert(db, records, via):
             if not (row[0] and row[1] and row[6] is not None and row[3] is not None):
                 raise ValueError
             row[3] = int(row[3])
+            if row[5]:
+                row[5] = norm_path(row[5]) or "/"
             rows.append(row + [via, now])
         except (ValueError, TypeError, AttributeError):
             bad += 1
@@ -429,14 +441,14 @@ def filters(a):
     where, params = [], []
     if getattr(a, "here", False):
         # The hook stores $HOSTNAME, the peers know the short name.
-        where.append("host IN (?, ?) AND pwd = ?")
-        params += [socket.gethostname(), hostname(), cwd()]
+        where.append("host IN (?, ?) AND %s = ?" % NORM_PWD)
+        params += [socket.gethostname(), hostname(), norm_path(cwd())]
     if a.host:
         where.append("host LIKE ?")
         params.append(a.host)
     if a.dir:
-        where.append("pwd LIKE ?")
-        params.append(a.dir)
+        where.append("%s LIKE ?" % NORM_PWD)
+        params.append(norm_path(a.dir))
     if a.since:
         where.append("ts >= strftime('%s', ?, 'utc')")
         params.append(a.since)
@@ -486,7 +498,10 @@ def cmd_complete(a):
                 "GROUP BY pwd ORDER BY max(ts) DESC LIMIT 500",
     }
     sql = queries[a.what]
-    for (value,) in db.execute(sql, (a.prefix,) if "?1" in sql else ()):
+    prefix = a.prefix
+    if a.what == "dirs" and prefix:
+        prefix = re.sub("/+", "/", os.path.expanduser(prefix))
+    for (value,) in db.execute(sql, (prefix,) if "?1" in sql else ()):
         if value:
             print(value)
 
@@ -575,7 +590,11 @@ def main():
     p.add_argument("prefix", nargs="?", default="")
     p.set_defaults(func=cmd_complete)
 
-    a = ap.parse_args(sys.argv[1:] or ["search"])
+    # Without a subcommand, the arguments are for search ("histsync -a git").
+    argv = sys.argv[1:]
+    if not argv or (argv[0] not in sub.choices and argv[0] not in ("-h", "--help")):
+        argv = ["search"] + argv
+    a = ap.parse_args(argv)
     os.umask(0o077)
     sys.exit(a.func(a) or 0)
 
