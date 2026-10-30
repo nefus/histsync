@@ -118,6 +118,11 @@ Use a deterministic ID for imports (e.g. `import:file:line`) so that
 repeating an import is harmless. To undo an import:
 `histsync delete -o 'import:file'`.
 
+## Changes
+
+See [CHANGELOG.md](CHANGELOG.md). `histsync --version` and `histsync status`
+show the installed version.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).

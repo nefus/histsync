@@ -115,7 +115,8 @@ _histsync_complete ()
             return ;;
     esac
     case $sub in
-        search) opts="-H --host -d --dir -s --since -x --exact -o --origin -. --here -a --all -n --limit" ;;
+        search) opts="-H --host -d --dir -s --since -x --exact -o --origin -. --here -a --all -n --limit"
+                (( cword == 1 )) && opts+=" -V --version" ;;
         delete) opts="-H --host -d --dir -s --since -x --exact -o --origin --id -y --yes" ;;
         sync)   opts="-q --quiet --peer" ;;
         import-bash-history)
