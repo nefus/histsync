@@ -73,6 +73,63 @@ _histsync_hook ()
     return $rc
 }
 
+# Completion for histsync and hs; values for -H, -d, -o and peers come from
+# the local database. Works without the bash-completion package.
+_histsync_complete ()
+{
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]}
+    local bin=$HOME/.local/bin/histsync sub opts
+    [[ -x $bin ]] || bin=histsync
+    COMPREPLY=()
+    if [[ ${COMP_WORDS[0]##*/} == hs ]]; then
+        sub=search
+    elif (( COMP_CWORD == 1 )); then
+        COMPREPLY=($(compgen -W "sync add remove peers status search delete" -- "$cur"))
+        return
+    else
+        sub=${COMP_WORDS[1]}
+    fi
+    case $prev in
+        -H|--host|-o|--origin|--peer)
+            local what=hosts
+            [[ $prev == -o || $prev == --origin ]] && what=origins
+            [[ $prev == --peer ]] && what=peers
+            COMPREPLY=($(compgen -W "$("$bin" _complete $what 2>/dev/null)" -- "$cur"))
+            # "import:..." contains a colon, which is a word break in Bash
+            declare -F __ltrim_colon_completions >/dev/null && __ltrim_colon_completions "$cur"
+            return ;;
+        -d|--dir)
+            local IFS=$'\n' dir
+            for dir in $("$bin" _complete dirs "$cur" 2>/dev/null); do
+                COMPREPLY+=("$(printf '%q' "$dir")")
+            done
+            return ;;
+        -s|--since|-n|--limit|-x|--exact|--id)
+            return ;;
+    esac
+    case $sub in
+        search) opts="-H --host -d --dir -s --since -x --exact -o --origin -. --here -n --limit" ;;
+        delete) opts="-H --host -d --dir -s --since -x --exact -o --origin --id -y --yes" ;;
+        sync)   opts="-q --quiet --peer" ;;
+        add)    opts="--no-sync"
+                if [[ $cur != -* ]]; then
+                    if declare -F _known_hosts_real >/dev/null; then
+                        _known_hosts_real -- "$cur"
+                    else
+                        COMPREPLY=($(compgen -W "$(awk 'tolower($1) == "host" { for (i = 2; i <= NF; i++)
+                            if ($i !~ /[*?]/) print $i }' ~/.ssh/config 2>/dev/null)" -- "$cur"))
+                    fi
+                    return
+                fi ;;
+        remove) if [[ $cur != -* ]]; then
+                    COMPREPLY=($(compgen -W "$("$bin" _complete peers 2>/dev/null)" -- "$cur"))
+                    return
+                fi ;;
+    esac
+    [[ $cur == -* ]] && COMPREPLY=($(compgen -W "$opts -h --help" -- "$cur"))
+}
+complete -F _histsync_complete histsync hs
+
 # Prepend, so that $? is still the status of the command. A starship loaded
 # later moves the hook into STARSHIP_PROMPT_COMMAND and provides the status
 # in STARSHIP_CMD_STATUS.

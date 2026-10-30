@@ -12,7 +12,8 @@
 #
 # Installed files:
 #   ~/.local/bin/histsync                    sync, search, peer management
-#   ~/.local/share/histsync/histsync.bash    hook, sourced from ~/.bashrc
+#   ~/.local/bin/hs                          symlink, short for "histsync search"
+#   ~/.local/share/histsync/histsync.bash    hook and completion, sourced from ~/.bashrc
 #   ~/.local/share/histsync/history.sqlite   local database (kept on uninstall)
 #   ~/.config/histsync/config                configuration (kept on uninstall)
 #   ~/.config/systemd/user/histsync.{service,timer}
@@ -72,6 +73,7 @@ if [[ -n $uninstall ]]; then
         systemctl --user disable --now histsync.timer 2>/dev/null || true
     fi
     rm -f "$units/histsync.service" "$units/histsync.timer" "$bin/histsync" "$share/histsync.bash"
+    [[ -L $bin/hs ]] && rm -f "$bin/hs"
     have_systemd && systemctl --user daemon-reload
     [[ -f $bashrc ]] && sed -i '/# histsync$/d' "$bashrc"
     echo "histsync removed. Database, spool and configuration are kept in"
@@ -84,6 +86,11 @@ python3 -c 'import sys; sys.exit(sys.version_info < (3, 7))' ||
 
 install -d "$bin" "$share" "$conf_dir"
 install -m 755 "$src/histsync" "$bin/histsync"
+if [[ -e $bin/hs && ! -L $bin/hs ]]; then
+    echo "Note: $bin/hs exists and is not a symlink, leaving it alone." >&2
+else
+    ln -sfn histsync "$bin/hs"
+fi
 install -m 644 "$src/histsync.bash" "$share/histsync.bash"
 
 if [[ ! -f $conf ]]; then

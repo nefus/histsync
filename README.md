@@ -46,6 +46,9 @@ kept).
 
 ## Usage
 
+    hs                                    # history of this host in the current directory
+    hs docker compose                     # = histsync search docker compose
+    hs -. git                             # only this host and directory, containing "git"
     histsync status                       # database per host, spool, peers with last sync
     histsync sync [--peer HOST]           # sync now
     histsync search docker compose        # commands containing both words
@@ -54,6 +57,15 @@ kept).
     histsync delete -H laptop -s 2026-10-30 passwd   # shows matches, asks first
     sqlite3 ~/.local/share/histsync/history.sqlite \
         "select * from history_v where exit <> 0 order by time desc limit 20"
+
+`hs` is a symlink to `histsync` and short for `histsync search`; without
+arguments it means `--here` (current host and directory, shown without the
+host and directory columns).
+
+Tab completion for `histsync` and `hs` is part of `histsync.bash` and does not
+need the bash-completion package. It completes subcommands and options, hosts
+(`-H`), directories (`-d`), origins (`-o`) and peers from the local database,
+and SSH hosts for `histsync add`.
 
 ## Configuration
 

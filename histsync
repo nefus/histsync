@@ -21,6 +21,9 @@ deleted), which is passed to the peers like the entries. Entries with a
 tombstone are never inserted again. Deleting rows directly via SQL without a
 tombstone is undone by a peer on the next sync.
 
+"hs" (a symlink to this script) is short for "histsync search"; without
+arguments it shows the history of the current host in the current directory.
+
 Configuration: ~/.config/histsync/config (KEY=VALUE); environment variables
 of the same name take precedence:
   HISTSYNC_DB          local database (default ~/.local/share/histsync/history.sqlite)
@@ -409,9 +412,24 @@ def open_ingested(cfg):
     return db
 
 
+def cwd():
+    """Current directory as the shell sees it (keeps symlinks, like the hook's $PWD)."""
+    pwd = os.environ.get("PWD")
+    try:
+        if pwd and os.path.samefile(pwd, "."):
+            return pwd
+    except OSError:
+        pass
+    return os.getcwd()
+
+
 def filters(a):
     """WHERE conditions from the options shared by search and delete."""
     where, params = [], []
+    if getattr(a, "here", False):
+        # The hook stores $HOSTNAME, the peers know the short name.
+        where.append("host IN (?, ?) AND pwd = ?")
+        params += [socket.gethostname(), hostname(), cwd()]
     if a.host:
         where.append("host LIKE ?")
         params.append(a.host)
@@ -433,10 +451,14 @@ def filters(a):
     return where, params
 
 
-def print_rows(rows):
+def print_rows(rows, short=False):
     for ts, host, pwd, ex, cmd in rows:
         t = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-        print("%s  %-10s %-30s %3s  %s" % (t, host, pwd, "" if ex is None else ex, cmd.replace("\n", "\n    ")))
+        ex = "" if ex is None else ex
+        if short:
+            print("%s %3s  %s" % (t, ex, cmd.replace("\n", "\n    ")))
+        else:
+            print("%s  %-10s %-30s %3s  %s" % (t, host, pwd, ex, cmd.replace("\n", "\n    ")))
 
 
 def cmd_search(a):
@@ -444,7 +466,26 @@ def cmd_search(a):
     where, params = filters(a)
     sql = ("SELECT * FROM (SELECT ts, host, pwd, exit, cmd FROM history%s ORDER BY ts DESC, seq DESC LIMIT ?) ORDER BY ts"
            % (" WHERE " + " AND ".join(where) if where else ""))
-    print_rows(db.execute(sql, params + [a.limit]))
+    print_rows(db.execute(sql, params + [a.limit]), short=a.here)
+
+
+def cmd_complete(a):
+    """(internal) Candidates for the Bash completion, one per line."""
+    try:
+        db = open_db(config()["HISTSYNC_DB"])
+    except (OSError, sqlite3.Error, SystemExit):
+        return 0
+    queries = {
+        "hosts": "SELECT host FROM history GROUP BY host ORDER BY max(ts) DESC",
+        "origins": "SELECT origin FROM history WHERE origin IS NOT NULL GROUP BY origin",
+        "peers": "SELECT target FROM peers ORDER BY target",
+        "dirs": "SELECT pwd FROM history WHERE substr(pwd, 1, length(?1)) = ?1 "
+                "GROUP BY pwd ORDER BY max(ts) DESC LIMIT 500",
+    }
+    sql = queries[a.what]
+    for (value,) in db.execute(sql, (a.prefix,) if "?1" in sql else ()):
+        if value:
+            print(value)
 
 
 def cmd_delete(a):
@@ -477,7 +518,8 @@ def cmd_delete(a):
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="histsync", description=__doc__.split("\n")[0])
+    is_hs = os.path.basename(sys.argv[0]) == "hs"
+    ap = argparse.ArgumentParser(prog="hs" if is_hs else "histsync", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("sync", help="move the spool into the database and sync with all peers")
@@ -502,7 +544,8 @@ def main():
 
     for name in ("search", "delete"):
         p = sub.add_parser(name, help="search the history of all hosts" if name == "search"
-                           else "delete entries on all hosts (with tombstones)")
+                           else "delete entries on all hosts (with tombstones)",
+                           **({"prog": "hs"} if is_hs else {}))
         p.add_argument("-H", "--host", help="host (SQL LIKE, e.g. 'web%%')")
         p.add_argument("-d", "--dir", help="directory (SQL LIKE, e.g. '%%/src/%%')")
         p.add_argument("-s", "--since", help="from this time on, e.g. 2026-10-01")
@@ -510,6 +553,8 @@ def main():
         p.add_argument("-o", "--origin", help="origin (SQL LIKE), e.g. hook or 'import:%%'")
         p.add_argument("pattern", nargs="*", help="text that must occur in the command")
         if name == "search":
+            p.add_argument("-.", "--here", action="store_true",
+                           help="only the current host and directory (default of hs without arguments)")
             p.add_argument("-n", "--limit", type=int, default=50)
             p.set_defaults(func=cmd_search)
         else:
@@ -523,7 +568,15 @@ def main():
     p.add_argument("--del-after", type=int, default=0)
     p.set_defaults(func=cmd_exchange)
 
-    a = ap.parse_args()
+    p = sub.add_parser("_complete", help="(internal) candidates for the Bash completion")
+    p.add_argument("what", choices=("hosts", "origins", "peers", "dirs"))
+    p.add_argument("prefix", nargs="?", default="")
+    p.set_defaults(func=cmd_complete)
+
+    argv = sys.argv[1:]
+    if is_hs:
+        argv = ["search"] + (argv or ["--here"])
+    a = ap.parse_args(argv)
     os.umask(0o077)
     sys.exit(a.func(a) or 0)
 
