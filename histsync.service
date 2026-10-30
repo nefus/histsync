@@ -1,0 +1,6 @@
+[Unit]
+Description=Sync Bash history with peers (histsync)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/histsync sync -q

@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""histsync - synchronise Bash history between hosts, peer to peer.
+
+The Bash hook (histsync.bash) appends every command as a JSON line to a local
+spool file. "histsync sync" moves the spool into the local SQLite database
+and then reconciles it with every registered peer ("histsync add HOST"): in a
+single SSH connection, new local entries go to the peer and new entries of
+the peer come back. Entries are immutable and have unique IDs, so the
+databases converge; whatever a peer got from a third host is passed on too.
+
+The peer only needs python3: the client sends its own source along
+("python3 -c <source> exchange ..."). Only the host that runs sync needs SSH
+access; the peer does not have to know it.
+
+For each peer the database remembers up to which local seq entries were sent
+and up to which seq of the peer they were fetched. Entries that came from a
+peer (column via) are not sent back to it.
+
+"histsync delete" removes entries and records a tombstone for each (table
+deleted), which is passed to the peers like the entries. Entries with a
+tombstone are never inserted again. Deleting rows directly via SQL without a
+tombstone is undone by a peer on the next sync.
+
+Configuration: ~/.config/histsync/config (KEY=VALUE); environment variables
+of the same name take precedence:
+  HISTSYNC_DB          local database (default ~/.local/share/histsync/history.sqlite)
+  HISTSYNC_SSH_OPTS    additional ssh options
+  HISTSYNC_SHELL_SYNC  1 = the Bash hook triggers sync itself (without systemd)
+  HISTSYNC_HOSTNAME    own name towards peers (default: short hostname; for tests)
+"""
+
+import argparse
+import datetime
+import fcntl
+import glob
+import json
+import os
+import shlex
+import socket
+import sqlite3
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state"), "histsync")
+CONFIG_FILE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "histsync/config")
+SPOOL = os.path.join(STATE_DIR, "spool.jsonl")
+DEFAULT_DB = "~/.local/share/histsync/history.sqlite"
+SCHEMA_VERSION = 3
+
+FIELDS = ("id", "host", "user", "ts", "tz", "pwd", "cmd", "exit", "tty", "ssh", "session", "origin")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS history (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,  -- local order, for the peer cursors
+    id       TEXT NOT NULL UNIQUE,
+    host     TEXT NOT NULL,
+    user     TEXT,
+    ts       INTEGER NOT NULL,   -- start time of the command, Unix seconds
+    tz       TEXT,               -- UTC offset of the client, e.g. +0100
+    pwd      TEXT,
+    cmd      TEXT NOT NULL,
+    exit     INTEGER,
+    tty      TEXT,
+    ssh      TEXT,               -- $SSH_CONNECTION
+    session  TEXT,               -- PID of the shell
+    origin   TEXT,               -- source, e.g. hook
+    via      TEXT,               -- peer the entry came from (NULL = local)
+    received INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS history_ts ON history (ts);
+CREATE INDEX IF NOT EXISTS history_host_ts ON history (host, ts);
+CREATE INDEX IF NOT EXISTS history_pwd ON history (pwd);
+CREATE INDEX IF NOT EXISTS history_host_cmd ON history (host, cmd);
+CREATE VIEW IF NOT EXISTS history_v AS
+    SELECT datetime(ts, 'unixepoch', 'localtime') AS time, host, user, pwd, exit, cmd, tty, ssh, session, origin, id
+    FROM history;
+CREATE TABLE IF NOT EXISTS deleted (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    id       TEXT NOT NULL UNIQUE,  -- ID of the deleted entry
+    time     INTEGER NOT NULL,      -- time of deletion
+    host     TEXT,                  -- host the entry was deleted on
+    via      TEXT                   -- peer the tombstone came from (NULL = local)
+);
+CREATE TABLE IF NOT EXISTS peers (
+    target   TEXT PRIMARY KEY,            -- SSH destination
+    sent     INTEGER NOT NULL DEFAULT 0,  -- local seq up to which entries were sent
+    fetched  INTEGER NOT NULL DEFAULT 0,  -- peer seq up to which entries were fetched
+    del_sent    INTEGER NOT NULL DEFAULT 0,  -- the same for tombstones
+    del_fetched INTEGER NOT NULL DEFAULT 0,
+    time     INTEGER,
+    ok       INTEGER,
+    msg      TEXT
+);
+"""
+
+
+def config():
+    cfg = {"HISTSYNC_DB": DEFAULT_DB, "HISTSYNC_SSH_OPTS": ""}
+    try:
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                        value = value[1:-1]
+                    cfg[key.strip()] = value
+    except FileNotFoundError:
+        pass
+    for key in list(cfg):
+        if key in os.environ:
+            cfg[key] = os.environ[key]
+    return cfg
+
+
+def hostname():
+    return os.environ.get("HISTSYNC_HOSTNAME") or socket.gethostname().split(".")[0]
+
+
+def is_self(target):
+    return target.rsplit("@", 1)[-1].split(".")[0] in ("localhost", hostname())
+
+
+def ssh_base(cfg, target):
+    """Non-interactive ssh call; also finds the agent when run from systemd."""
+    if not os.environ.get("SSH_AUTH_SOCK"):
+        run = os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+        for sock in ("openssh_agent", "ssh-agent.socket", "gcr/ssh", "keyring/ssh"):
+            if os.path.exists(os.path.join(run, sock)):
+                os.environ["SSH_AUTH_SOCK"] = os.path.join(run, sock)
+                break
+    return (["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+            + shlex.split(cfg["HISTSYNC_SSH_OPTS"]) + [target])
+
+
+def remote_self(cfg, target, args):
+    """Command line that runs this source on the peer."""
+    with open(os.path.abspath(__file__)) as f:
+        src = f.read()
+    return ssh_base(cfg, target) + [" ".join(shlex.quote(a) for a in ["python3", "-c", src] + args)]
+
+
+# --- database ---------------------------------------------------------------
+
+def private_dir(path):
+    """Directory readable only by the user (the history may contain passwords)."""
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def open_db(path):
+    path = os.path.expanduser(path)
+    private_dir(os.path.dirname(path))
+    db = sqlite3.connect(path, timeout=60)
+    os.chmod(path, 0o600)
+    db.execute("PRAGMA journal_mode=WAL")
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version > SCHEMA_VERSION:
+        sys.exit("%s has schema %d, this histsync only knows %d" % (path, version, SCHEMA_VERSION))
+    db.executescript(SCHEMA)
+    db.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+    return db
+
+
+def insert(db, records, via):
+    """Insert entries (dicts), ignoring known IDs; returns (valid, new, invalid)."""
+    now = int(time.time())
+    rows, bad = [], 0
+    for rec in records:
+        try:
+            row = [rec.get(f) for f in FIELDS]
+            if not (row[0] and row[1] and row[6] is not None and row[3] is not None):
+                raise ValueError
+            row[3] = int(row[3])
+            rows.append(row + [via, now])
+        except (ValueError, TypeError, AttributeError):
+            bad += 1
+    before = db.total_changes
+    db.executemany("INSERT OR IGNORE INTO history (%s, via, received) SELECT %s "
+                   "WHERE NOT EXISTS (SELECT 1 FROM deleted WHERE id = ?)"
+                   % (", ".join(FIELDS), ", ".join("?" * (len(FIELDS) + 2))), [r + [r[0]] for r in rows])
+    return len(rows), db.total_changes - before, bad
+
+
+def apply_deletes(db, marks, via):
+    """Apply tombstones ({"deleted": id, ...}); returns (received, new)."""
+    marks = [m for m in marks if m.get("deleted")]
+    before = db.total_changes
+    db.executemany("INSERT OR IGNORE INTO deleted (id, time, host, via) VALUES (?, ?, ?, ?)",
+                   [(m["deleted"], int(m.get("time") or time.time()), m.get("host"), via) for m in marks])
+    new = db.total_changes - before
+    db.executemany("DELETE FROM history WHERE id = ?", [(m["deleted"],) for m in marks])
+    return len(marks), new
+
+
+def split(records):
+    """Split JSON lines into (tombstones, entries)."""
+    marks, rows = [], []
+    for rec in records:
+        (marks if isinstance(rec, dict) and "deleted" in rec else rows).append(rec)
+    return marks, rows
+
+
+def parse_lines(lines):
+    for line in lines:
+        try:
+            yield json.loads(line)
+        except ValueError:
+            yield None
+
+
+def select_records(db, after, upto, exclude_via):
+    """Entries with after < seq <= upto, without those that came from the other side."""
+    return db.execute("SELECT %s FROM history WHERE seq > ? AND seq <= ? AND via IS NOT ? ORDER BY seq"
+                      % ", ".join(FIELDS), (after, upto, exclude_via))
+
+
+def select_deletes(db, after, upto, exclude_via):
+    return db.execute("SELECT id, time, host FROM deleted WHERE seq > ? AND seq <= ? AND via IS NOT ? ORDER BY seq",
+                      (after, upto, exclude_via))
+
+
+def max_seq(db, table="history"):
+    return db.execute("SELECT coalesce(max(seq), 0) FROM %s" % table).fetchone()[0]
+
+
+# --- peer side --------------------------------------------------------------
+
+def cmd_exchange(a):
+    """(on the peer) Store the caller's entries from stdin, then print own
+    entries with seq > --after; the last line confirms completion."""
+    db = open_db(config()["HISTSYNC_DB"])
+    # Pick up the own spool, even if the peer never syncs by itself.
+    held = lock()
+    if held is not None:
+        ingest(db)
+        held.close()
+    stream = open(sys.stdin.fileno(), encoding="utf-8", errors="replace")
+    marks, records = split(parse_lines(stream))
+    with db:
+        del_got, del_new = apply_deletes(db, marks, a.peer)
+        got, new, bad = insert(db, records, a.peer)
+    out = sys.stdout
+    with db:  # one read snapshot for cursor and data
+        db.execute("BEGIN")
+        upto, del_upto = max_seq(db), max_seq(db, "deleted")
+        for id_, t, host in select_deletes(db, a.del_after, del_upto, a.peer):
+            out.write(json.dumps({"deleted": id_, "time": t, "host": host}) + "\n")
+        for row in select_records(db, a.after, upto, a.peer):
+            out.write(json.dumps(dict(zip(FIELDS, row))) + "\n")
+    out.write(json.dumps({"done": True, "host": hostname(), "seq": upto, "del_seq": del_upto,
+                          "received": got, "new": new, "invalid": bad,
+                          "del_received": del_got, "del_new": del_new}) + "\n")
+
+
+# --- local ------------------------------------------------------------------
+
+def lock():
+    """Only one sync at a time; None if one is already running."""
+    private_dir(STATE_DIR)
+    if os.path.exists(SPOOL):
+        os.chmod(SPOOL, 0o600)
+    f = open(os.path.join(STATE_DIR, "sync.lock"), "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return None
+    return f
+
+
+def ingest(db):
+    """Move the spool into the local database."""
+    # The hook reopens the file for every line (>>), so after the rename new
+    # commands end up in a fresh spool. Renamed files left over from an
+    # interrupted run are picked up as well.
+    files = sorted(glob.glob(os.path.join(STATE_DIR, "spool.*.jsonl")))
+    if os.path.exists(SPOOL) and os.path.getsize(SPOOL) > 0:
+        files.append(os.path.join(STATE_DIR, "spool.%d.jsonl" % time.time_ns()))
+        os.replace(SPOOL, files[-1])
+    new = 0
+    for path in files:
+        with open(path, encoding="utf-8", errors="replace") as f, db:
+            new += insert(db, parse_lines(f), None)[1]
+        os.unlink(path)
+    return new
+
+
+def exchange(cfg, db, target):
+    """Reconcile with one peer; returns (ok, message) and records it in peers."""
+    sent, fetched, del_sent, del_fetched = db.execute(
+        "SELECT sent, fetched, del_sent, del_fetched FROM peers WHERE target = ?", (target,)).fetchone()
+    upto, del_upto = max_seq(db), max_seq(db, "deleted")
+    data = "".join(json.dumps({"deleted": i, "time": t, "host": h}) + "\n"
+                   for i, t, h in select_deletes(db, del_sent, del_upto, target))
+    data += "".join(json.dumps(dict(zip(FIELDS, r))) + "\n" for r in select_records(db, sent, upto, target))
+    p = subprocess.run(remote_self(cfg, target, ["exchange", "--peer", hostname(), "--after", str(fetched),
+                                                 "--del-after", str(del_fetched)]),
+                       input=data.encode(), capture_output=True)
+    lines = p.stdout.decode(errors="replace").splitlines()
+    done = json.loads(lines[-1]) if lines and lines[-1].startswith('{"done"') else None
+    if p.returncode != 0 or not done:
+        msg = "failed: %s" % (p.stderr.decode(errors="replace").strip() or "incomplete response")
+        with db:
+            db.execute("UPDATE peers SET time = ?, ok = 0, msg = ? WHERE target = ?",
+                       (int(time.time()), msg[-500:], target))
+        return False, msg
+    # Write only after a complete response; an interrupted run changes nothing.
+    with db:
+        marks, records = split(parse_lines(lines[:-1]))
+        del_got, del_new = apply_deletes(db, marks, target)
+        got, new, bad = insert(db, records, target)
+        msg = "sent %d (new %d), fetched %d (new %d)" % (done["received"], done["new"], got, new)
+        if done["del_received"] or del_got:
+            msg += "; deletions sent %d (new %d), fetched %d (new %d)" % (
+                done["del_received"], done["del_new"], del_got, del_new)
+        db.execute("UPDATE peers SET sent = ?, fetched = ?, del_sent = ?, del_fetched = ?, time = ?, ok = 1, "
+                   "msg = ? WHERE target = ?",
+                   (upto, done["seq"], del_upto, done["del_seq"], int(time.time()), msg, target))
+    return True, msg
+
+
+def sync(cfg, only=None):
+    held = lock()
+    if held is None:
+        return True, ["already running"]
+    db = open_db(cfg["HISTSYNC_DB"])
+    msgs = ["local: %d new entries from the spool" % ingest(db)]
+    ok = True
+    for (target,) in db.execute("SELECT target FROM peers ORDER BY target").fetchall():
+        if only and target != only:
+            continue
+        good, msg = exchange(cfg, db, target)
+        ok = ok and good
+        msgs.append("%s: %s" % (target, msg))
+    return ok, msgs
+
+
+def cmd_sync(a):
+    ok, msgs = sync(config(), a.peer)
+    for msg in msgs:
+        if not ok or not a.quiet:
+            print(msg, file=sys.stdout if ok else sys.stderr)
+    return 0 if ok else 1
+
+
+def cmd_add(a):
+    cfg = config()
+    if is_self(a.target):
+        print("%s is this host" % a.target, file=sys.stderr)
+        return 1
+    db = open_db(cfg["HISTSYNC_DB"])
+    with db:
+        db.execute("INSERT OR IGNORE INTO peers (target) VALUES (?)", (a.target,))
+    if a.no_sync:
+        return 0
+    ok, msgs = sync(cfg, a.target)
+    print("\n".join(msgs), file=sys.stdout if ok else sys.stderr)
+    if not ok:
+        print("%s stays registered, the next sync will retry "
+              "(to remove it: histsync remove %s)" % (a.target, a.target), file=sys.stderr)
+    return 0 if ok else 1
+
+
+def cmd_remove(a):
+    db = open_db(config()["HISTSYNC_DB"])
+    with db:
+        n = db.execute("DELETE FROM peers WHERE target = ?", (a.target,)).rowcount
+    if not n:
+        print("%s is not a peer" % a.target, file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_peers(a):
+    for (target,) in open_db(config()["HISTSYNC_DB"]).execute("SELECT target FROM peers ORDER BY target"):
+        print(target)
+
+
+def cmd_status(a):
+    cfg = config()
+    db = open_db(cfg["HISTSYNC_DB"])
+    spool = sum(1 for _ in open(SPOOL, "rb")) if os.path.exists(SPOOL) else 0
+    total = db.execute("SELECT count(*) FROM history").fetchone()[0]
+    marks = db.execute("SELECT count(*) FROM deleted").fetchone()[0]
+    print("DB:    %s, %d entries, %d tombstones, %d in the spool" % (cfg["HISTSYNC_DB"], total, marks, spool))
+    for host, n, last in db.execute("SELECT host, count(*), max(ts) FROM history GROUP BY host ORDER BY 2 DESC"):
+        print("       %-12s %7d  until %s" % (host, n, datetime.datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M")))
+    peers = db.execute("SELECT target, time, ok, msg, (SELECT count(*) FROM history h "
+                       "WHERE h.seq > p.sent AND h.via IS NOT p.target) + (SELECT count(*) FROM deleted d "
+                       "WHERE d.seq > p.del_sent AND d.via IS NOT p.target) FROM peers p ORDER BY target").fetchall()
+    if not peers:
+        print("Peers: none (histsync add HOST)")
+    for target, t, ok, msg, pending in peers:
+        when = datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M:%S") if t else "-"
+        print("Peer:  %-12s %d to send; last sync %s %s %s"
+              % (target, pending, when, "" if ok is None else "ok" if ok else "FAILED", msg or ""))
+
+
+def open_ingested(cfg):
+    """Local database, after moving the spool in (unless a sync is running)."""
+    held = lock()
+    db = open_db(cfg["HISTSYNC_DB"])
+    if held is not None:
+        ingest(db)
+        held.close()
+    return db
+
+
+def filters(a):
+    """WHERE conditions from the options shared by search and delete."""
+    where, params = [], []
+    if a.host:
+        where.append("host LIKE ?")
+        params.append(a.host)
+    if a.dir:
+        where.append("pwd LIKE ?")
+        params.append(a.dir)
+    if a.since:
+        where.append("ts >= strftime('%s', ?, 'utc')")
+        params.append(a.since)
+    if a.origin:
+        where.append("origin LIKE ?")
+        params.append(a.origin)
+    if a.exact:
+        where.append("cmd = ?")
+        params.append(a.exact)
+    for p in a.pattern:
+        where.append("cmd LIKE ?")
+        params.append("%" + p + "%")
+    return where, params
+
+
+def print_rows(rows):
+    for ts, host, pwd, ex, cmd in rows:
+        t = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        print("%s  %-10s %-30s %3s  %s" % (t, host, pwd, "" if ex is None else ex, cmd.replace("\n", "\n    ")))
+
+
+def cmd_search(a):
+    db = open_ingested(config())
+    where, params = filters(a)
+    sql = ("SELECT * FROM (SELECT ts, host, pwd, exit, cmd FROM history%s ORDER BY ts DESC, seq DESC LIMIT ?) ORDER BY ts"
+           % (" WHERE " + " AND ".join(where) if where else ""))
+    print_rows(db.execute(sql, params + [a.limit]))
+
+
+def cmd_delete(a):
+    db = open_ingested(config())
+    where, params = filters(a)
+    if a.id:
+        where.append("id IN (%s)" % ", ".join("?" * len(a.id)))
+        params += a.id
+    if not where:
+        print("without a filter everything would be deleted; give a pattern, -x, -o, -H, -d, -s or --id",
+              file=sys.stderr)
+        return 2
+    rows = db.execute("SELECT id, ts, host, pwd, exit, cmd FROM history WHERE %s ORDER BY ts, seq"
+                      % " AND ".join(where), params).fetchall()
+    if not rows:
+        print("no matching entries")
+        return 0
+    print_rows([r[1:] for r in rows[:20]])
+    if len(rows) > 20:
+        print("... and %d more" % (len(rows) - 20))
+    if not a.yes:
+        if not sys.stdin.isatty():
+            print("%d entries; use -y to delete without confirmation" % len(rows), file=sys.stderr)
+            return 1
+        if input("Delete %d entries on all hosts? [y/N] " % len(rows)).strip().lower() not in ("y", "yes"):
+            return 1
+    with db:
+        apply_deletes(db, [{"deleted": r[0], "time": int(time.time()), "host": hostname()} for r in rows], None)
+    print("%d entries deleted; peers will follow on the next sync" % len(rows))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="histsync", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("sync", help="move the spool into the database and sync with all peers")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("--peer", help="only sync with this peer")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("add", help="register a peer and sync with it right away")
+    p.add_argument("target", help="SSH destination, e.g. laptop or user@server")
+    p.add_argument("--no-sync", action="store_true", help="only register")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("remove", help="unregister a peer (its entries stay)")
+    p.add_argument("target")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("peers", help="list peers")
+    p.set_defaults(func=cmd_peers)
+
+    p = sub.add_parser("status", help="show local database, spool and peers")
+    p.set_defaults(func=cmd_status)
+
+    for name in ("search", "delete"):
+        p = sub.add_parser(name, help="search the history of all hosts" if name == "search"
+                           else "delete entries on all hosts (with tombstones)")
+        p.add_argument("-H", "--host", help="host (SQL LIKE, e.g. 'web%%')")
+        p.add_argument("-d", "--dir", help="directory (SQL LIKE, e.g. '%%/src/%%')")
+        p.add_argument("-s", "--since", help="from this time on, e.g. 2026-10-01")
+        p.add_argument("-x", "--exact", help="exactly this command")
+        p.add_argument("-o", "--origin", help="origin (SQL LIKE), e.g. hook or 'import:%%'")
+        p.add_argument("pattern", nargs="*", help="text that must occur in the command")
+        if name == "search":
+            p.add_argument("-n", "--limit", type=int, default=50)
+            p.set_defaults(func=cmd_search)
+        else:
+            p.add_argument("--id", action="append", help="entry with this ID (repeatable)")
+            p.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
+            p.set_defaults(func=cmd_delete)
+
+    p = sub.add_parser("exchange", help="(internal, runs on the peer) exchange entries")
+    p.add_argument("--peer", required=True, help="name of the calling host")
+    p.add_argument("--after", type=int, default=0)
+    p.add_argument("--del-after", type=int, default=0)
+    p.set_defaults(func=cmd_exchange)
+
+    a = ap.parse_args()
+    os.umask(0o077)
+    sys.exit(a.func(a) or 0)
+
+
+if __name__ == "__main__":
+    main()

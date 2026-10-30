@@ -1,0 +1,11 @@
+[Unit]
+Description=Sync Bash history every two minutes (histsync)
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=2min
+AccuracySec=15s
+Unit=histsync.service
+
+[Install]
+WantedBy=timers.target
